@@ -1,0 +1,511 @@
+// ─────────────────────────────────────────────────────────────────
+// ContentView.swift
+// FILE 1 of 2  →  Goes in your MAIN APP target (Thread)
+//
+// This is the home screen of the Thread app.
+// It shows:
+//   • Articles the user saved from Safari
+//   • Articles shared with friends
+//   • A friend list for sharing
+// ─────────────────────────────────────────────────────────────────
+
+import SwiftUI
+
+// ═════════════════════════════════════════
+// MARK: 1.  SHARED DATA STORE
+//
+// UserDefaults with an App Group lets BOTH the main app
+// AND the Share Extension read/write the same data.
+// Think of it like a shared notebook between two apps.
+//
+// ⚠️  Replace "group.com.yourname.thread" with the App Group
+//     ID you create in Xcode → Signing & Capabilities.
+// ═════════════════════════════════════════
+
+let APP_GROUP = "group.com.yourname.thread"  // ← change this
+
+/// One saved article (stored as a dictionary in UserDefaults)
+struct SavedArticle: Identifiable, Codable {
+    var id          = UUID().uuidString
+    var title       : String
+    var urlString   : String
+    var savedDate   : Date
+    var sharedBy    : String?   // nil = saved by me, name = shared by friend
+    var sharedWith  : [String]  // friends I forwarded it to
+}
+
+/// Simple friend model
+struct Friend: Identifiable {
+    let id   = UUID()
+    let name : String
+    let emoji: String           // avatar placeholder
+}
+
+/// The friends list (replace with real contacts / backend later)
+let myFriends: [Friend] = [
+    Friend(name: "Alex",   emoji: "🧢"),
+    Friend(name: "Jordan", emoji: "🎧"),
+    Friend(name: "Morgan", emoji: "📚"),
+    Friend(name: "Taylor", emoji: "🎨"),
+    Friend(name: "Riley",  emoji: "🌿"),
+]
+
+// ─────────────────────────────────────────
+// Helper: read & write saved articles
+// ─────────────────────────────────────────
+
+func loadArticles() -> [SavedArticle] {
+    let defaults = UserDefaults(suiteName: APP_GROUP)
+    guard
+        let data = defaults?.data(forKey: "savedArticles"),
+        let decoded = try? JSONDecoder().decode([SavedArticle].self, from: data)
+    else { return [] }
+    return decoded
+}
+
+func saveArticles(_ articles: [SavedArticle]) {
+    let defaults = UserDefaults(suiteName: APP_GROUP)
+    if let encoded = try? JSONEncoder().encode(articles) {
+        defaults?.set(encoded, forKey: "savedArticles")
+    }
+}
+
+// ═════════════════════════════════════════
+// MARK: 2.  CONTENT VIEW  (Home Screen)
+// ═════════════════════════════════════════
+
+struct ContentView: View {
+
+    // All saved articles, loaded from shared storage
+    @State private var articles: [SavedArticle] = []
+
+    // Which article the user wants to share with a friend
+    @State private var articleToShare: SavedArticle? = nil
+
+    // Reload articles every time the app comes to the foreground
+    // (so new saves from the Share Extension appear immediately)
+    @Environment(\.scenePhase) private var scenePhase
+
+    // Articles I saved myself (no sharedBy value)
+    var mySaves: [SavedArticle] {
+        articles.filter { $0.sharedBy == nil }
+    }
+
+    // Articles friends sent me
+    var sharedWithMe: [SavedArticle] {
+        articles.filter { $0.sharedBy != nil }
+    }
+
+    var body: some View {
+        NavigationView {
+            Group {
+                if articles.isEmpty {
+                    // ── Empty state ──
+                    EmptyStateView()
+                } else {
+                    // ── Article lists ──
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 0) {
+
+                            // Recently Saved section
+                            if !mySaves.isEmpty {
+                                SectionHeader(title: "Recently Saved", icon: "📌")
+                                    .padding(.horizontal)
+                                    .padding(.top, 24)
+
+                                LazyVGrid(
+                                    columns: [GridItem(.flexible()), GridItem(.flexible())],
+                                    spacing: 16
+                                ) {
+                                    ForEach(mySaves) { article in
+                                        ArticleCard(article: article) {
+                                            articleToShare = article
+                                        }
+                                    }
+                                }
+                                .padding(.horizontal)
+                                .padding(.top, 12)
+                            }
+
+                            // Shared With You section
+                            if !sharedWithMe.isEmpty {
+                                SectionHeader(title: "Shared With You", icon: "🔗")
+                                    .padding(.horizontal)
+                                    .padding(.top, 32)
+
+                                VStack(spacing: 12) {
+                                    ForEach(sharedWithMe) { article in
+                                        SharedArticleRow(article: article) {
+                                            articleToShare = article
+                                        }
+                                    }
+                                }
+                                .padding(.horizontal)
+                                .padding(.top, 12)
+                            }
+
+                            Spacer(minLength: 40)
+                        }
+                    }
+                }
+            }
+            .background(Color(.systemGroupedBackground))
+            .navigationTitle("Thread")
+            .navigationBarTitleDisplayMode(.large)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Debug") {
+                        let defaults = UserDefaults(suiteName: APP_GROUP)
+                        if let data = defaults?.data(forKey: "savedArticles"),
+                           let str = String(data: data, encoding: .utf8) {
+                            print("📦 Raw savedArticles JSON:\n\(str)")
+                        } else {
+                            print("❌ Nothing in savedArticles key")
+                        }
+                    }
+                }
+            }
+        }
+        // Load articles when app opens
+        .onAppear {
+            articles = loadArticles()
+        }
+        // Reload when app comes back from background
+        .onChange(of: scenePhase) { phase in
+            if phase == .active {
+                articles = loadArticles()
+            }
+        }
+        // Share-with-friend sheet
+        .sheet(item: $articleToShare) { article in
+            ShareWithFriendView(article: article) { updatedArticle in
+                // After sharing, update that article in our list
+                if let index = articles.firstIndex(where: { $0.id == updatedArticle.id }) {
+                    articles[index] = updatedArticle
+                    saveArticles(articles)
+                }
+            }
+        }
+    }
+}
+
+
+// ═════════════════════════════════════════
+// MARK: 3.  SHARE WITH FRIEND VIEW
+//
+// This popup appears when the user taps the share button
+// on any saved article. It shows the friends list and
+// lets them pick who to send it to.
+// ═════════════════════════════════════════
+
+struct ShareWithFriendView: View {
+    let article   : SavedArticle
+    let onShared  : (SavedArticle) -> Void   // called after sharing
+
+    @Environment(\.dismiss) private var dismiss
+
+    // Which friend the user just tapped (shows a checkmark)
+    @State private var justSharedWith: String? = nil
+
+    var body: some View {
+        NavigationView {
+            VStack(spacing: 0) {
+
+                // Article preview at the top
+                ArticlePreviewBanner(article: article)
+                    .padding()
+
+                Divider()
+
+                // "Send to a friend" label
+                Text("Send to a friend")
+                    .font(.caption.weight(.semibold))
+                    .foregroundColor(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal)
+                    .padding(.top, 20)
+                    .padding(.bottom, 8)
+
+                // Friends list
+                ScrollView {
+                    VStack(spacing: 10) {
+                        ForEach(myFriends) { friend in
+                            FriendRow(
+                                friend: friend,
+                                isShared: justSharedWith == friend.name
+                            ) {
+                                shareTo(friend: friend)
+                            }
+                        }
+                    }
+                    .padding(.horizontal)
+                }
+
+                Spacer()
+            }
+            .background(Color(.systemGroupedBackground))
+            .navigationTitle("Share Article")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Done") { dismiss() }
+                }
+            }
+        }
+    }
+
+    // Called when the user taps a friend row
+    private func shareTo(friend: Friend) {
+        justSharedWith = friend.name
+
+        // Update the article to record who we shared it with
+        var updated = article
+        if !updated.sharedWith.contains(friend.name) {
+            updated.sharedWith.append(friend.name)
+        }
+        onShared(updated)
+
+        // Dismiss after a short delay so the user sees the checkmark
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+            dismiss()
+        }
+    }
+}
+
+// ═════════════════════════════════════════
+// MARK: 4.  SUPPORTING VIEWS
+// ═════════════════════════════════════════
+
+// ── Article preview banner inside the share sheet ──
+struct ArticlePreviewBanner: View {
+    let article: SavedArticle
+
+    var body: some View {
+        HStack(spacing: 14) {
+            // Icon placeholder
+            ZStack {
+                RoundedRectangle(cornerRadius: 10)
+                    .fill(Color.accentColor.opacity(0.12))
+                    .frame(width: 56, height: 56)
+                Image(systemName: "doc.text.fill")
+                    .font(.title2)
+                    .foregroundColor(.accentColor)
+            }
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(article.title)
+                    .font(.subheadline.weight(.semibold))
+                    .lineLimit(2)
+                Text(article.urlString)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+            }
+            Spacer()
+        }
+        .padding(14)
+        .background(Color(.systemBackground))
+        .cornerRadius(14)
+        .shadow(color: .black.opacity(0.06), radius: 6, x: 0, y: 2)
+    }
+}
+
+// ── One row in the friends list ──
+struct FriendRow: View {
+    let friend  : Friend
+    let isShared: Bool
+    let onTap   : () -> Void
+
+    var body: some View {
+        Button(action: onTap) {
+            HStack(spacing: 14) {
+                // Emoji avatar
+                Text(friend.emoji)
+                    .font(.title2)
+                    .frame(width: 44, height: 44)
+                    .background(Color(.secondarySystemBackground))
+                    .clipShape(Circle())
+
+                Text(friend.name)
+                    .font(.body.weight(.medium))
+                    .foregroundColor(.primary)
+
+                Spacer()
+
+                // Checkmark after sharing, arrow before
+                if isShared {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundColor(.green)
+                        .font(.title3)
+                } else {
+                    Image(systemName: "paperplane.fill")
+                        .foregroundColor(.accentColor)
+                        .font(.body)
+                }
+            }
+            .padding(14)
+            .background(Color(.systemBackground))
+            .cornerRadius(14)
+            .shadow(color: .black.opacity(0.04), radius: 4, x: 0, y: 1)
+        }
+    }
+}
+
+// ── Article card (2-column grid tile) ──
+struct ArticleCard: View {
+    let article : SavedArticle
+    let onShare : () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+
+            // Thumbnail with share button
+            ZStack(alignment: .topTrailing) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 10)
+                        .fill(
+                            LinearGradient(
+                                colors: [Color.accentColor.opacity(0.7), Color.accentColor.opacity(0.3)],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            )
+                        )
+                        .frame(height: 100)
+                    Image(systemName: "doc.text.fill")
+                        .font(.largeTitle)
+                        .foregroundColor(.white.opacity(0.85))
+                }
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+
+                // Share button in top-right corner
+                Button(action: onShare) {
+                    Image(systemName: "square.and.arrow.up")
+                        .font(.caption.weight(.semibold))
+                        .foregroundColor(.white)
+                        .padding(7)
+                        .background(.ultraThinMaterial)
+                        .clipShape(Circle())
+                }
+                .padding(8)
+            }
+
+            // Title & URL
+            VStack(alignment: .leading, spacing: 4) {
+                Text(article.title)
+                    .font(.subheadline.weight(.semibold))
+                    .lineLimit(3)
+                    .foregroundColor(.primary)
+                    .padding(.top, 8)
+
+                Text(article.urlString)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+                    .padding(.top, 2)
+
+                // "Shared with X" badge
+                if !article.sharedWith.isEmpty {
+                    Text("Shared with \(article.sharedWith.joined(separator: ", "))")
+                        .font(.caption2.weight(.medium))
+                        .foregroundColor(.accentColor)
+                        .padding(.top, 4)
+                }
+            }
+            .padding(.horizontal, 4)
+            .padding(.bottom, 12)
+        }
+        .background(Color(.systemBackground))
+        .cornerRadius(14)
+        .shadow(color: .black.opacity(0.06), radius: 6, x: 0, y: 2)
+    }
+}
+
+// ── Full-width row for articles shared BY a friend ──
+struct SharedArticleRow: View {
+    let article : SavedArticle
+    let onShare : () -> Void
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 14) {
+            // Icon
+            ZStack {
+                RoundedRectangle(cornerRadius: 10)
+                    .fill(Color.accentColor.opacity(0.12))
+                    .frame(width: 56, height: 56)
+                Image(systemName: "doc.text.fill")
+                    .font(.title2)
+                    .foregroundColor(.accentColor)
+            }
+
+            // Text
+            VStack(alignment: .leading, spacing: 4) {
+                if let sender = article.sharedBy {
+                    Text("From \(sender)")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundColor(.accentColor)
+                }
+                Text(article.title)
+                    .font(.subheadline.weight(.semibold))
+                    .lineLimit(2)
+                Text(article.urlString)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+            }
+
+            Spacer()
+
+            // Forward-share button
+            Button(action: onShare) {
+                Image(systemName: "square.and.arrow.up")
+                    .foregroundColor(.accentColor)
+            }
+            .padding(.top, 4)
+        }
+        .padding(14)
+        .background(Color(.systemBackground))
+        .cornerRadius(14)
+        .shadow(color: .black.opacity(0.06), radius: 6, x: 0, y: 2)
+    }
+
+}
+
+
+// ── Section header (e.g. "📌 Recently Saved") ──
+struct SectionHeader: View {
+    let title: String
+    let icon : String
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Text(icon)
+            Text(title).font(.title3.bold())
+        }
+    }
+}
+
+// ── Empty state when the user has no saves yet ──
+struct EmptyStateView: View {
+    var body: some View {
+        VStack(spacing: 16) {
+            Image(systemName: "bookmark.slash")
+                .font(.system(size: 52))
+                .foregroundColor(.secondary)
+            Text("No saves yet")
+                .font(.title3.bold())
+            Text("Open Safari, find an article,\ntap Share → Thread to save it here.")
+                .font(.subheadline)
+                .foregroundColor(.secondary)
+                .multilineTextAlignment(.center)
+        }
+        .padding(40)
+    }
+}
+
+// ═════════════════════════════════════════
+// MARK: 5.  PREVIEW
+// ═════════════════════════════════════════
+
+#Preview {
+    ContentView()
+}
