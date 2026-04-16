@@ -1,0 +1,1089 @@
+import Combine
+import SwiftUI
+import UIKit
+
+private enum ThreadSharedConfig {
+    static let appGroupID = "group.com.danieltrego.IOS491.shared"
+    static let savedArticlesKey = "savedArticles"
+    static let foldersKey = "articleFolders"
+}
+
+struct SavedArticle: Identifiable, Codable, Hashable {
+    var id: String
+    var title: String
+    var urlString: String
+    var savedDate: Date
+    var sharedBy: String?
+    var sharedWith: [String]
+    var folderName: String?
+    var keywords: [String]
+    var summary: String?
+
+    init(
+        id: String = UUID().uuidString,
+        title: String,
+        urlString: String,
+        savedDate: Date,
+        sharedBy: String? = nil,
+        sharedWith: [String] = [],
+        folderName: String? = nil,
+        keywords: [String] = [],
+        summary: String? = nil
+    ) {
+        self.id = id
+        self.title = title
+        self.urlString = urlString
+        self.savedDate = savedDate
+        self.sharedBy = sharedBy
+        self.sharedWith = sharedWith
+        self.folderName = folderName
+        self.keywords = keywords
+        self.summary = summary
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decodeIfPresent(String.self, forKey: .id) ?? UUID().uuidString
+        title = try container.decode(String.self, forKey: .title)
+        urlString = try container.decode(String.self, forKey: .urlString)
+        savedDate = try container.decode(Date.self, forKey: .savedDate)
+        sharedBy = try container.decodeIfPresent(String.self, forKey: .sharedBy)
+        sharedWith = try container.decodeIfPresent([String].self, forKey: .sharedWith) ?? []
+        folderName = try container.decodeIfPresent(String.self, forKey: .folderName)
+        keywords = try container.decodeIfPresent([String].self, forKey: .keywords) ?? []
+        summary = try container.decodeIfPresent(String.self, forKey: .summary)
+    }
+
+    var url: URL? {
+        URL(string: urlString)
+    }
+
+    var hostLabel: String {
+        url?.host() ?? urlString
+    }
+
+    var effectiveFolderName: String {
+        if let folderName, !folderName.isEmpty {
+            return folderName
+        }
+
+        return "Un-Categorized"
+    }
+    
+}
+
+private enum NavigationSection: String, CaseIterable, Hashable {
+    case home = "Home"
+    case folders = "Folders"
+    case keywords = "Keywords"
+    
+
+    var systemImage: String {
+        switch self {
+        case .home:
+            return "house.fill"
+        case .folders:
+            return "folder.fill"
+        case .keywords:
+            return "tag.fill"
+        }
+    }
+}
+
+private enum FolderFilter: Hashable {
+    case all
+    case unfiled
+    case named(String)
+
+    var title: String {
+        switch self {
+        case .all:
+            return "All"
+        case .unfiled:
+            return "Un-Catergorized"
+        case .named(let name):
+            return name
+        }
+    }
+}
+
+@MainActor
+final class ArticleStore: ObservableObject {
+    @Published private(set) var articles: [SavedArticle] = []
+    @Published private(set) var folders: [String] = []
+    @Published private(set) var isSharedStorageAvailable = true
+
+    private let decoder = JSONDecoder()
+    private let encoder = JSONEncoder()
+
+    func reload() {
+        guard let defaults = UserDefaults(suiteName: ThreadSharedConfig.appGroupID) else {
+            isSharedStorageAvailable = false
+            articles = []
+            folders = []
+            return
+        }
+
+        isSharedStorageAvailable = true
+
+        if let data = defaults.data(forKey: ThreadSharedConfig.savedArticlesKey),
+           let decoded = try? decoder.decode([SavedArticle].self, from: data) {
+            articles = decoded.sorted(by: { $0.savedDate > $1.savedDate })
+        } else {
+            articles = []
+        }
+
+        if let data = defaults.data(forKey: ThreadSharedConfig.foldersKey),
+           let decoded = try? decoder.decode([String].self, from: data) {
+            folders = decoded.sorted()
+        } else {
+            folders = []
+        }
+
+        syncFoldersFromArticles()
+    }
+
+    func createFolder(named rawName: String) {
+        let folderName = normalizedValue(rawName)
+        guard !folderName.isEmpty else { return }
+        guard !folders.contains(folderName) else { return }
+
+        folders.append(folderName)
+        folders.sort()
+        persistFolders()
+    }
+
+    func updateArticle(
+        _ article: SavedArticle,
+        folder: String?,
+        keywords: [String]
+    ) {
+        guard let index = articles.firstIndex(where: { $0.id == article.id }) else {
+            return
+        }
+
+        let normalizedFolder = normalizedValue(folder)
+        if !normalizedFolder.isEmpty {
+            createFolder(named: normalizedFolder)
+        }
+
+        articles[index].folderName = normalizedFolder.isEmpty ? nil : normalizedFolder
+        articles[index].keywords = normalizedKeywords(keywords)
+        persistArticles()
+        syncFoldersFromArticles()
+    }
+
+    func keywordCounts() -> [(keyword: String, count: Int)] {
+        let counts = articles
+            .flatMap(\.keywords)
+            .reduce(into: [String: Int]()) { partialResult, keyword in
+                partialResult[keyword, default: 0] += 1
+            }
+
+        return counts.keys.sorted().map { ($0, counts[$0] ?? 0) }
+    }
+
+    private func syncFoldersFromArticles() {
+        let articleFolders = articles.compactMap(\.folderName).filter { !$0.isEmpty }
+        folders = Array(Set(folders).union(articleFolders)).sorted()
+        persistFolders()
+    }
+
+    private func persistArticles() {
+        guard let defaults = UserDefaults(suiteName: ThreadSharedConfig.appGroupID) else {
+            isSharedStorageAvailable = false
+            return
+        }
+
+        isSharedStorageAvailable = true
+        articles = articles.sorted(by: { $0.savedDate > $1.savedDate })
+
+        guard let data = try? encoder.encode(articles) else {
+            return
+        }
+
+        defaults.set(data, forKey: ThreadSharedConfig.savedArticlesKey)
+    }
+
+    private func persistFolders() {
+        guard let defaults = UserDefaults(suiteName: ThreadSharedConfig.appGroupID) else {
+            isSharedStorageAvailable = false
+            return
+        }
+
+        isSharedStorageAvailable = true
+        folders = folders.sorted()
+
+        guard let data = try? encoder.encode(folders) else {
+            return
+        }
+
+        defaults.set(data, forKey: ThreadSharedConfig.foldersKey)
+    }
+
+    private func normalizedKeywords(_ keywords: [String]) -> [String] {
+        let tokens = keywords
+            .map(normalizedValue)
+            .filter { !$0.isEmpty }
+
+        return Array(NSOrderedSet(array: tokens)) as? [String] ?? tokens
+    }
+
+    private func normalizedValue(_ value: String?) -> String {
+        value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+}
+
+struct ContentView: View {
+    @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    @Environment(\.openURL) private var openURL
+
+    @StateObject private var store = ArticleStore()
+    @State private var searchText = ""
+    @State private var selectedSection: NavigationSection = .home
+    @State private var selectedFilter: FolderFilter = .all
+    @State private var selectedKeyword: String?
+    @State private var articleToShare: SavedArticle?
+    @State private var articleToEdit: SavedArticle?
+    @State private var isShowingCreateFolderSheet = false
+
+    private var folderFilters: [FolderFilter] {
+        [.all, .unfiled] + store.folders.map(FolderFilter.named)
+    }
+
+    private var filteredArticles: [SavedArticle] {
+        store.articles.filter { article in
+            matchesSearch(article) && matchesFolder(article) && matchesKeyword(article)
+        }
+    }
+
+    private var mySaves: [SavedArticle] {
+        filteredArticles.filter { $0.sharedBy == nil }
+    }
+
+    private var sharedWithMe: [SavedArticle] {
+        filteredArticles.filter { $0.sharedBy != nil }
+    }
+
+    private var gridColumns: [GridItem] {
+        let count = horizontalSizeClass == .regular ? 2 : 1
+        return Array(repeating: GridItem(.flexible(), spacing: 16), count: count)
+    }
+
+    private var keywordCounts: [(keyword: String, count: Int)] {
+        store.keywordCounts()
+    }
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 20) {
+                    SectionNavigationBar(selectedSection: $selectedSection)
+                    
+                    if selectedSection == .folders {
+                        FolderFilterBar(filters: folderFilters, selectedFilter: $selectedFilter)
+                    }
+                    
+                    if selectedSection == .keywords {
+                        KeywordFilterBar(
+                            keywords: keywordCounts,
+                            selectedKeyword: $selectedKeyword
+                        )
+                    }
+                    
+                    FolderSummaryCard(
+                        title: summaryTitle,
+                        subtitle: summarySubtitle,
+                        count: filteredArticles.count
+                    )
+                    
+                    contentView
+                }
+                .padding(20)
+            }
+            .background(Color.white)
+            .navigationTitle("Thread")
+            .searchable(text: $searchText, prompt: "Search titles, folders, keywords, or sites")
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        isShowingCreateFolderSheet = true
+                    } label: {
+                        Label("New Folder", systemImage: "folder.badge.plus")
+                    }
+                }
+            }
+            
+            .safeAreaInset(edge: .bottom) {
+                if !store.isSharedStorageAvailable {
+                    SharedStorageWarning()
+                }
+            }
+//            @ViewBuilder
+//             var contentView: some View {
+//                .background(Color.white)
+//                .navigationTitle("Thread")
+//                .searchable(text: $searchText, prompt: "Search titles, folders, keywords, or sites")
+//                .toolbar {
+//                    ToolbarItem(placement: .topBarTrailing) {
+//                        Button {
+//                            isShowingCreateFolderSheet = true
+//                        } label: {
+//                            Label("New Folder", systemImage: "folder.badge.plus")
+//                        }
+//                    }
+//                }
+//                
+//                .safeAreaInset(edge: .bottom) {
+//                    if !store.isSharedStorageAvailable {
+//                        SharedStorageWarning()
+//                    }
+//                }
+//            }
+            .sheet(item: $articleToShare) { article in
+                ActivityViewController(items: shareItems(for: article))
+            }
+            .sheet(item: $articleToEdit) { article in
+                ArticleMetadataEditor(
+                    article: article,
+                    folders: store.folders,
+                    onSave: { folderName, keywords in
+                        store.updateArticle(article, folder: folderName, keywords: keywords)
+                    },
+                    onCreateFolder: { folderName in
+                        store.createFolder(named: folderName)
+                    }
+                )
+            }
+            .sheet(isPresented: $isShowingCreateFolderSheet) {
+                CreateFolderView { folderName in
+                    store.createFolder(named: folderName)
+                }
+            }
+            .onAppear {
+                store.reload()
+            }
+            .onChange(of: scenePhase) { _, newPhase in
+                if newPhase == .active {
+                    store.reload()
+                }
+            }
+            .onChange(of: store.folders) { _, folders in
+                if case .named(let name) = selectedFilter, !folders.contains(name) {
+                    selectedFilter = .all
+                }
+            }
+            .onChange(of: selectedSection) { _, newValue in
+                switch newValue {
+                case .home:
+                    selectedFilter = .all
+                    selectedKeyword = nil
+                case .folders:
+                    selectedKeyword = nil
+                case .keywords:
+                    selectedFilter = .all
+                case .share:
+                    selectedFilter = .all
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var contentView: some View {
+        if filteredArticles.isEmpty {
+            EmptyStateView(
+                isSearching: !searchText.isEmpty,
+                selectedSection: selectedSection,
+                onReset: resetNavigation
+            )
+        } else {
+            if selectedSection == .keywords {
+                KeywordOverviewSection(
+                    keywords: keywordCounts,
+                    selectedKeyword: $selectedKeyword
+                )
+            }
+
+            if !mySaves.isEmpty {
+                VStack(alignment: .leading, spacing: 12) {
+                    SectionHeader(
+                        title: "Saved",
+                        subtitle: "Articles captured from Safari"
+                    )
+
+                    LazyVGrid(columns: gridColumns, spacing: 16) {
+                        ForEach(mySaves) { article in
+                            ArticleCard(
+                                article: article,
+                                onOpen: { openArticle(article) },
+                                onShare: { articleToShare = article },
+                                onEdit: { articleToEdit = article }
+                            )
+                        }
+                    }
+                }
+            }
+
+            if !sharedWithMe.isEmpty {
+                VStack(alignment: .leading, spacing: 12) {
+                    SectionHeader(
+                        title: "Shared With You",
+                        subtitle: "Articles from people in your network"
+                    )
+
+                    ForEach(sharedWithMe) { article in
+                        SharedArticleRow(
+                            article: article,
+                            onOpen: { openArticle(article) },
+                            onShare: { articleToShare = article },
+                            onEdit: { articleToEdit = article }
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    private var summaryTitle: String {
+        switch selectedSection {
+        case .home:
+            return "Library"
+        case .folders:
+            return selectedFilter.title
+        case .keywords:
+            return selectedKeyword ?? "Keywords"
+        case .share:
+            return "Share"
+        }
+    }
+
+    private var summarySubtitle: String {
+        switch selectedSection {
+        case .home:
+            return "Browse everything you have saved"
+        case .folders:
+            return "Filter by folder without losing your way back"
+        case .keywords:
+            return "Filter by the keywords you attach to articles"
+        case .share:
+            return "Content Shared With You"
+        }
+    }
+
+    private func resetNavigation() {
+        selectedSection = .home
+        selectedFilter = .all
+        selectedKeyword = nil
+        searchText = ""
+    }
+
+    private func matchesSearch(_ article: SavedArticle) -> Bool {
+        guard !searchText.isEmpty else { return true }
+
+        return article.title.localizedCaseInsensitiveContains(searchText)
+            || article.urlString.localizedCaseInsensitiveContains(searchText)
+            || article.hostLabel.localizedCaseInsensitiveContains(searchText)
+            || article.effectiveFolderName.localizedCaseInsensitiveContains(searchText)
+            || article.keywords.contains(where: { $0.localizedCaseInsensitiveContains(searchText) })
+            || (article.summary?.localizedCaseInsensitiveContains(searchText) ?? false)
+    }
+
+    private func matchesFolder(_ article: SavedArticle) -> Bool {
+        guard selectedSection != .keywords else { return true }
+
+        switch selectedFilter {
+        case .all:
+            return true
+        case .unfiled:
+            return article.folderName == nil || article.folderName?.isEmpty == true
+        case .named(let name):
+            return article.folderName == name
+        }
+    }
+
+    private func matchesKeyword(_ article: SavedArticle) -> Bool {
+        guard selectedSection == .keywords, let selectedKeyword else { return true }
+        return article.keywords.contains(selectedKeyword)
+    }
+
+    private func openArticle(_ article: SavedArticle) {
+        guard let url = article.url else { return }
+        openURL(url)
+    }
+
+    private func shareItems(for article: SavedArticle) -> [Any] {
+        var items: [Any] = [article.title]
+
+        if let summary = article.summary, !summary.isEmpty {
+            items.append(summary)
+        }
+
+        if let url = article.url {
+            items.append(url)
+        }
+
+        return items
+    }
+}
+
+private struct ActivityViewController: UIViewControllerRepresentable {
+    let items: [Any]
+
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: items, applicationActivities: nil)
+    }
+
+    func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {
+    }
+}
+
+private struct SectionNavigationBar: View {
+    @Binding var selectedSection: NavigationSection
+
+    var body: some View {
+        HStack(spacing: 10) {
+            ForEach(NavigationSection.allCases, id: \.self) { section in
+                Button {
+                    selectedSection = section
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: section.systemImage)
+                        Text(section.rawValue)
+                    }
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(selectedSection == section ? .white : .primary)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 12)
+                    .background(
+                        selectedSection == section ? Color.blue : Color(.secondarySystemBackground),
+                        in: RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    )
+                }
+                .buttonStyle(.plain)
+            }
+        }
+    }
+}
+
+private struct SectionHeader: View {
+    let title: String
+    let subtitle: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title)
+                .font(.title3.weight(.bold))
+            Text(subtitle)
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+        }
+    }
+}
+
+private struct FolderFilterBar: View {
+    let filters: [FolderFilter]
+    @Binding var selectedFilter: FolderFilter
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 10) {
+                ForEach(filters, id: \.self) { filter in
+                    Button {
+                        selectedFilter = filter
+                    } label: {
+                        Text(filter.title)
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(selectedFilter == filter ? .white : .primary)
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 10)
+                            .background(
+                                selectedFilter == filter ? Color.orange : Color(.secondarySystemBackground),
+                                in: Capsule()
+                            )
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+    }
+}
+
+private struct KeywordFilterBar: View {
+    let keywords: [(keyword: String, count: Int)]
+    @Binding var selectedKeyword: String?
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 10) {
+                Button {
+                    selectedKeyword = nil
+                } label: {
+                    Text("All Keywords")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(selectedKeyword == nil ? .white : .primary)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 10)
+                        .background(
+                            selectedKeyword == nil ? Color.green : Color(.secondarySystemBackground),
+                            in: Capsule()
+                        )
+                }
+                .buttonStyle(.plain)
+
+                ForEach(keywords, id: \.keyword) { item in
+                    Button {
+                        selectedKeyword = item.keyword
+                    } label: {
+                        Text("\(item.keyword) \(item.count)")
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(selectedKeyword == item.keyword ? .white : .primary)
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 10)
+                            .background(
+                                selectedKeyword == item.keyword ? Color.green : Color(.secondarySystemBackground),
+                                in: Capsule()
+                            )
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+    }
+}
+
+private struct KeywordOverviewSection: View {
+    let keywords: [(keyword: String, count: Int)]
+    @Binding var selectedKeyword: String?
+
+    var body: some View {
+        if !keywords.isEmpty {
+            VStack(alignment: .leading, spacing: 12) {
+                SectionHeader(
+                    title: "Keyword Index",
+                    subtitle: "Tap a keyword to narrow the library"
+                )
+
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 110), spacing: 10)], spacing: 10) {
+                    ForEach(keywords, id: \.keyword) { item in
+                        Button {
+                            selectedKeyword = item.keyword
+                        } label: {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(item.keyword)
+                                    .font(.subheadline.weight(.semibold))
+                                    .foregroundStyle(.primary)
+                                Text("\(item.count) article\(item.count == 1 ? "" : "s")")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(12)
+                            .background(Color(.systemBackground), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+        }
+    }
+}
+
+private struct FolderSummaryCard: View {
+    let title: String
+    let subtitle: String
+    let count: Int
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 14) {
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .fill(Color.orange.opacity(0.16))
+                .frame(width: 54, height: 54)
+                .overlay {
+                    Image(systemName: "tray.full.fill")
+                        .font(.title3)
+                        .foregroundStyle(Color.orange)
+                }
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title)
+                    .font(.headline)
+                Text(subtitle)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                Text("\(count) article\(count == 1 ? "" : "s")")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.tertiary)
+            }
+
+            Spacer()
+        }
+        .padding(16)
+        .background(Color(.systemBackground), in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+        .shadow(color: .black.opacity(0.05), radius: 12, x: 0, y: 6)
+    }
+}
+
+private struct ArticleCard: View {
+    let article: SavedArticle
+    let onOpen: () -> Void
+    let onShare: () -> Void
+    let onEdit: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            ZStack(alignment: .topTrailing) {
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .fill(
+                        LinearGradient(
+                            colors: [Color.blue.opacity(0.85), Color.cyan.opacity(0.55)],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                    )
+                    .frame(height: 122)
+                    .overlay {
+                        Image(systemName: "doc.richtext.fill")
+                            .font(.system(size: 34))
+                            .foregroundStyle(.white.opacity(0.9))
+                    }
+
+                HStack(spacing: 8) {
+                    TileActionButton(systemImage: "slider.horizontal.3", action: onEdit)
+                    TileActionButton(systemImage: "square.and.arrow.up", action: onShare)
+                }
+                .padding(10)
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                FolderBadge(title: article.effectiveFolderName)
+
+                Text(article.title)
+                    .font(.headline)
+                    .foregroundStyle(.primary)
+                    .lineLimit(3)
+
+                if let summary = article.summary, !summary.isEmpty {
+                    Text(summary)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(3)
+                }
+
+                KeywordWrapView(keywords: article.keywords)
+
+                Text(article.hostLabel)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+
+                Text(article.savedDate.formatted(date: .abbreviated, time: .shortened))
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(.systemBackground), in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+        .shadow(color: .black.opacity(0.05), radius: 12, x: 0, y: 6)
+        .contentShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+        .onTapGesture(perform: onOpen)
+    }
+}
+
+private struct SharedArticleRow: View {
+    let article: SavedArticle
+    let onOpen: () -> Void
+    let onShare: () -> Void
+    let onEdit: () -> Void
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 14) {
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .fill(Color.blue.opacity(0.12))
+                .frame(width: 58, height: 58)
+                .overlay {
+                    Image(systemName: "person.2.crop.square.stack.fill")
+                        .font(.title3)
+                        .foregroundStyle(Color.blue)
+                }
+
+            VStack(alignment: .leading, spacing: 5) {
+                if let sender = article.sharedBy {
+                    Text("From \(sender)")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(Color.blue)
+                }
+
+                FolderBadge(title: article.effectiveFolderName)
+
+                Text(article.title)
+                    .font(.headline)
+                    .foregroundStyle(.primary)
+                    .lineLimit(2)
+
+                if let summary = article.summary, !summary.isEmpty {
+                    Text(summary)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
+
+                KeywordWrapView(keywords: article.keywords)
+
+                Text(article.hostLabel)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+
+            Spacer(minLength: 12)
+
+            VStack(spacing: 8) {
+                TileActionButton(systemImage: "slider.horizontal.3", action: onEdit)
+                TileActionButton(systemImage: "square.and.arrow.up", action: onShare)
+            }
+        }
+        .padding(16)
+        .background(Color(.systemBackground), in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+        .shadow(color: .black.opacity(0.05), radius: 12, x: 0, y: 6)
+        .contentShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+        .onTapGesture(perform: onOpen)
+    }
+}
+
+private struct TileActionButton: View {
+    let systemImage: String
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: systemImage)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(Color.white)
+                .padding(10)
+                .background(.ultraThinMaterial, in: Circle())
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+private struct FolderBadge: View {
+    let title: String
+
+    var body: some View {
+        Text(title)
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(Color.orange)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
+            .background(Color.orange.opacity(0.12), in: Capsule())
+    }
+}
+
+private struct KeywordWrapView: View {
+    let keywords: [String]
+
+    var body: some View {
+        if !keywords.isEmpty {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 6) {
+                    ForEach(keywords, id: \.self) { keyword in
+                        Text("#\(keyword)")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(Color.green)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .background(Color.green.opacity(0.12), in: Capsule())
+                    }
+                }
+            }
+        }
+    }
+}
+
+private struct ArticleMetadataEditor: View {
+    let article: SavedArticle
+    let folders: [String]
+    let onSave: (String?, [String]) -> Void
+    let onCreateFolder: (String) -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var selectedFolder: String
+    @State private var newFolderName = ""
+    @State private var keywordsText: String
+
+    init(
+        article: SavedArticle,
+        folders: [String],
+        onSave: @escaping (String?, [String]) -> Void,
+        onCreateFolder: @escaping (String) -> Void
+    ) {
+        self.article = article
+        self.folders = folders
+        self.onSave = onSave
+        self.onCreateFolder = onCreateFolder
+        _selectedFolder = State(initialValue: article.folderName ?? "")
+        _keywordsText = State(initialValue: article.keywords.joined(separator: ", "))
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Folder") {
+                    Picker("Folder", selection: $selectedFolder) {
+                        Text("Unfiled").tag("")
+
+                        ForEach(folders, id: \.self) { folder in
+                            Text(folder).tag(folder)
+                        }
+                    }
+                    .pickerStyle(.inline)
+                }
+
+                Section("Create Folder") {
+                    TextField("Folder name", text: $newFolderName)
+
+                    Button("Add Folder") {
+                        let trimmedName = newFolderName.trimmingCharacters(in: .whitespacesAndNewlines)
+                        guard !trimmedName.isEmpty else { return }
+
+                        onCreateFolder(trimmedName)
+                        selectedFolder = trimmedName
+                        newFolderName = ""
+                    }
+                }
+
+                Section("Keywords") {
+                    TextField("news, design, reading list", text: $keywordsText, axis: .vertical)
+                        .lineLimit(2...4)
+
+                    if !article.keywords.isEmpty {
+                        KeywordWrapView(keywords: article.keywords)
+                    }
+                }
+            }
+            .navigationTitle("Edit Article")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") {
+                        dismiss()
+                    }
+                }
+
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save") {
+                        let folderName = selectedFolder.isEmpty ? nil : selectedFolder
+                        let keywords = keywordsText
+                            .split(separator: ",")
+                            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+                        onSave(folderName, keywords)
+                        dismiss()
+                    }
+                }
+            }
+        }
+    }
+}
+
+private struct CreateFolderView: View {
+    let onSave: (String) -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var folderName = ""
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                TextField("Folder name", text: $folderName)
+            }
+            .navigationTitle("New Folder")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") {
+                        dismiss()
+                    }
+                }
+
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Create") {
+                        let trimmedName = folderName.trimmingCharacters(in: .whitespacesAndNewlines)
+                        guard !trimmedName.isEmpty else { return }
+
+                        onSave(trimmedName)
+                        dismiss()
+                    }
+                }
+            }
+        }
+    }
+}
+
+private struct EmptyStateView: View {
+    let isSearching: Bool
+    let selectedSection: NavigationSection
+    let onReset: () -> Void
+
+    var body: some View {
+        VStack(spacing: 16) {
+            Image(systemName: isSearching ? "magnifyingglass" : "tray")
+                .font(.system(size: 48))
+                .foregroundStyle(.secondary)
+
+            Text(isSearching ? "No matches" : "Nothing here yet")
+                .font(.title3.weight(.bold))
+
+            Text(message)
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 24)
+
+            Button("Go Home", action: onReset)
+                .buttonStyle(.borderedProminent)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(.vertical, 40)
+        .background(Color(.systemGroupedBackground))
+    }
+
+    private var message: String {
+        if isSearching {
+            return "Try a different title, keyword, folder, or site name."
+        }
+
+        switch selectedSection {
+        case .home:
+            return "Open Safari, tap Share, and send an article to Thread. It will appear here when the app becomes active."
+        case .folders:
+            return "This folder view is empty right now. Switch folders above or go back home."
+        case .keywords:
+            return "No saved articles match this keyword filter yet. Pick another keyword or go back home."
+        case .share:
+            return "Browse through content that friends have shared with you."
+        }
+    }
+}
+
+private struct SharedStorageWarning: View {
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Shared storage is unavailable")
+                .font(.subheadline.weight(.semibold))
+            Text("Add the App Group `\(ThreadSharedConfig.appGroupID)` to both the app and the share extension.")
+                .font(.caption)
+        }
+        .foregroundStyle(.white)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.red.opacity(0.92))
+    }
+}
+
+#Preview {
+    ContentView()
+}
